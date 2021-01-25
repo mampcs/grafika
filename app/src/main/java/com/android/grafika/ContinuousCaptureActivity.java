@@ -163,6 +163,7 @@ public class ContinuousCaptureActivity extends Activity implements SurfaceHolder
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        Log.d(TAG,"onCreate");
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_continuous_capture);
 
@@ -176,6 +177,7 @@ public class ContinuousCaptureActivity extends Activity implements SurfaceHolder
         mOutputFile = new File(getFilesDir(), "continuous-capture.mp4");
         mSecondsOfVideo = 0.0f;
         updateControls();
+        Log.d(TAG,"onCreate");
     }
 
     @Override
@@ -183,8 +185,10 @@ public class ContinuousCaptureActivity extends Activity implements SurfaceHolder
         super.onResume();
 
         if (!PermissionHelper.hasCameraPermission(this)) {
+            Log.d(TAG,"onResume");
             PermissionHelper.requestCameraPermission(this, false);
         } else  {
+            Log.d(TAG,"onResume1");
             if (mCamera == null) {
                 // Ideally, the frames from the camera are at the same resolution as the input to
                 // the video encoder so we don't have to scale.
@@ -198,6 +202,7 @@ public class ContinuousCaptureActivity extends Activity implements SurfaceHolder
 
     @Override
     protected void onPause() {
+        Log.d(TAG,"onPause",new Exception());
         super.onPause();
 
         releaseCamera();

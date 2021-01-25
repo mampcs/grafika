@@ -16,8 +16,20 @@
 
 package com.android.grafika;
 
+import android.Manifest;
+import android.app.Activity;
+import android.content.Context;
 import android.graphics.SurfaceTexture;
-import android.hardware.Camera;
+import android.hardware.camera2.CameraAccessException;
+import android.hardware.camera2.CameraCaptureSession;
+import android.hardware.camera2.CameraCharacteristics;
+import android.hardware.camera2.CameraDevice;
+import android.hardware.camera2.CameraManager;
+import android.hardware.camera2.CameraMetadata;
+import android.hardware.camera2.CaptureRequest;
+import android.hardware.camera2.TotalCaptureResult;
+import android.hardware.camera2.params.RecommendedStreamConfigurationMap;
+import android.hardware.camera2.params.StreamConfigurationMap;
 import android.opengl.GLES20;
 import android.opengl.Matrix;
 import android.os.Bundle;
@@ -25,6 +37,8 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.Message;
 import android.util.Log;
+import android.util.Range;
+import android.util.Size;
 import android.view.MotionEvent;
 import android.view.Surface;
 import android.view.SurfaceHolder;
@@ -42,6 +56,10 @@ import com.android.grafika.gles.WindowSurface;
 
 import java.io.IOException;
 import java.lang.ref.WeakReference;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 
 /**
  * Direct the Camera preview to a GLES texture and manipulate it.
@@ -151,7 +169,7 @@ public class TextureFromCameraActivity extends Activity implements SurfaceHolder
             PermissionHelper.requestCameraPermission(this, false);
             return;
         }
-        mRenderThread = new RenderThread(mHandler);
+        mRenderThread = new RenderThread(mHandler, this);
         mRenderThread.setName("TexFromCam Render");
         mRenderThread.start();
         mRenderThread.waitUntilReady();
@@ -223,7 +241,7 @@ public class TextureFromCameraActivity extends Activity implements SurfaceHolder
 
         if (mRenderThread != null) {
             RenderHandler rh = mRenderThread.getHandler();
-            rh.sendSurfaceChanged(format, width, height);
+            rh.sendSurfaceChanged(holder,format, width, height);
         } else {
             Log.d(TAG, "Ignoring surfaceChanged");
             return;
@@ -441,9 +459,13 @@ public class TextureFromCameraActivity extends Activity implements SurfaceHolder
 
         private MainHandler mMainHandler;
 
-        private Camera mCamera;
+        private boolean mIsCameraStarted;
+        private CameraDevice mCameraDevice;
+        private CameraCaptureSession mCameraCaptureSessions;
+        private CaptureRequest.Builder mCaptureRequestBuilder;
+        private boolean mCaptureSessionStopped;
         private int mCameraPreviewWidth, mCameraPreviewHeight;
-
+        private Context mContext;
         private EglCore mEglCore;
         private WindowSurface mWindowSurface;
         private int mWindowSurfaceWidth;
@@ -470,8 +492,9 @@ public class TextureFromCameraActivity extends Activity implements SurfaceHolder
          * Constructor.  Pass in the MainHandler, which allows us to send stuff back to the
          * Activity.
          */
-        public RenderThread(MainHandler handler) {
+        public RenderThread(MainHandler handler, Context context) {
             mMainHandler = handler;
+            mContext = context;
         }
 
         /**
@@ -479,7 +502,11 @@ public class TextureFromCameraActivity extends Activity implements SurfaceHolder
          */
         @Override
         public void run() {
+            Log.d(TAG,"run");
             Looper.prepare();
+
+            // TBD: If this is moved lower, then we don't get a preview
+            openCamera(REQ_CAMERA_WIDTH, REQ_CAMERA_HEIGHT, REQ_CAMERA_FPS);
 
             // We need to create the Handler before reporting ready.
             mHandler = new RenderHandler(this);
@@ -490,7 +517,8 @@ public class TextureFromCameraActivity extends Activity implements SurfaceHolder
 
             // Prepare EGL and open the camera before we start handling messages.
             mEglCore = new EglCore(null, 0);
-            openCamera(REQ_CAMERA_WIDTH, REQ_CAMERA_HEIGHT, REQ_CAMERA_FPS);
+            // TBD: No preview if openCamera is called here
+            // openCamera(REQ_CAMERA_WIDTH, REQ_CAMERA_HEIGHT, REQ_CAMERA_FPS);
 
             Looper.loop();
 
@@ -557,7 +585,7 @@ public class TextureFromCameraActivity extends Activity implements SurfaceHolder
                 // bit of reallocating if a surface-changed message arrives.
                 mWindowSurfaceWidth = mWindowSurface.getWidth();
                 mWindowSurfaceHeight = mWindowSurface.getHeight();
-                finishSurfaceSetup();
+                finishSurfaceSetup(holder);
             }
 
             mCameraTexture.setOnFrameAvailableListener(this);
@@ -592,12 +620,12 @@ public class TextureFromCameraActivity extends Activity implements SurfaceHolder
          * could also be called with a Surface created on a previous run.  So this may not
          * be called.
          */
-        private void surfaceChanged(int width, int height) {
+        private void surfaceChanged(SurfaceHolder holder, int width, int height) {
             Log.d(TAG, "RenderThread surfaceChanged " + width + "x" + height);
 
             mWindowSurfaceWidth = width;
             mWindowSurfaceHeight = height;
-            finishSurfaceSetup();
+            finishSurfaceSetup(holder);
         }
 
         /**
@@ -615,7 +643,7 @@ public class TextureFromCameraActivity extends Activity implements SurfaceHolder
          * <p>
          * Open the camera (to set mCameraAspectRatio) before calling here.
          */
-        private void finishSurfaceSetup() {
+        private void finishSurfaceSetup(SurfaceHolder holder) {
             int width = mWindowSurfaceWidth;
             int height = mWindowSurfaceHeight;
             Log.d(TAG, "finishSurfaceSetup size=" + width + "x" + height +
@@ -635,12 +663,7 @@ public class TextureFromCameraActivity extends Activity implements SurfaceHolder
 
             // Ready to go, start the camera.
             Log.d(TAG, "starting camera preview");
-            try {
-                mCamera.setPreviewTexture(mCameraTexture);
-            } catch (IOException ioe) {
-                throw new RuntimeException(ioe);
-            }
-            mCamera.startPreview();
+            startPreview(holder);
         }
 
         /**
@@ -720,6 +743,136 @@ public class TextureFromCameraActivity extends Activity implements SurfaceHolder
             updateGeometry();
         }
 
+        /** Returns the ID of the first front-facing camera. */
+        private String getFirstFrontCameraId(CameraManager manager) {
+            Log.d(TAG, "Getting First FRONT Camera");
+            String cameraId = getFirstCameraFacing(manager);
+            if (cameraId == null) {
+                throw new RuntimeException("No front-facing camera found.");
+            }
+            return cameraId;
+        }
+
+        /** Returns the ID of the first camera facing the given direction. */
+        private String getFirstCameraFacing(CameraManager manager) {
+            try {
+                String[] cameraIds = manager.getCameraIdList();
+                for (String cameraId : cameraIds) {
+                    CameraCharacteristics characteristics =
+                            manager.getCameraCharacteristics(cameraId);
+                    if (characteristics != null &&
+                        characteristics.get(CameraCharacteristics.LENS_FACING) ==
+                                CameraCharacteristics.LENS_FACING_FRONT) {
+                        Log.d(TAG, "Got first front camera");
+                        return cameraId;
+                    }
+                }
+                return null;
+            } catch (CameraAccessException ex) {
+                throw new RuntimeException("Unable to get camera id", ex);
+            }
+        }
+
+        private void startPreview(SurfaceHolder holder) {
+            try {
+
+                List<Surface> outputSurfaces = new ArrayList<Surface>();
+                Surface surface = new Surface(mCameraTexture);
+
+                CameraManager manager =
+                        (CameraManager)mContext.getSystemService(Context.CAMERA_SERVICE);
+                String mCameraId = getFirstFrontCameraId(manager);
+                CameraCharacteristics characteristics =
+                        manager.getCameraCharacteristics(mCameraId);
+                Range<Integer>[] fpsRanges = characteristics.get(
+                        CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES);
+                for (Range<Integer> fps : fpsRanges) {
+                    Log.d(TAG, "fpsRange " + fps);
+                }
+
+                if (mCameraDevice != null) {
+                    mCaptureRequestBuilder =
+                            mCameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
+
+                    mCaptureRequestBuilder.addTarget(surface);
+                    outputSurfaces.add(surface);
+
+                    Range<Integer> fpsRange = Range.create(30, 30);
+                    mCaptureRequestBuilder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
+                                               fpsRange);
+                    mCaptureRequestBuilder.set(CaptureRequest.CONTROL_MODE,
+                                               CameraMetadata.CONTROL_MODE_AUTO);
+                    Log.d(TAG,"--> createCaptureSession");
+                    mCameraDevice.createCaptureSession(
+                        outputSurfaces,
+                        new CameraCaptureSession.StateCallback() {
+                            @Override
+                            public void onConfigured(CameraCaptureSession session) {
+                                if (mIsCameraStarted) {
+                                    Log.d(TAG,"onCameraCaptureSessionConfigured");
+                                    onCameraCaptureSessionConfigured(session);
+                                } else {
+                                    Log.w(TAG, "Discarding camera capture session configured cb");
+                                }
+                            }
+
+                            @Override
+                            public void onConfigureFailed(CameraCaptureSession session) {
+                                Log.e(TAG, "CameraCaptureSession config failed");
+                            }
+
+                            @Override
+                            public void onClosed(CameraCaptureSession session) {
+                                mCaptureSessionStopped = true;
+                                Log.d(TAG, "CameraCaptureSession closed");
+                            }
+                        },
+                        mMainHandler);
+                } else {
+                    Log.d(TAG,"mCameraDevice is null");
+                }
+            } catch (CameraAccessException e) {
+                e.printStackTrace();
+            } catch (SecurityException e) {
+                e.printStackTrace();
+            } catch (IllegalStateException e) {
+                e.printStackTrace();
+            }
+        }
+
+        private void onCameraCaptureSessionConfigured(CameraCaptureSession session) {
+            try {
+                mCameraCaptureSessions = session;
+                mCaptureSessionStopped = false;
+                mCameraCaptureSessions.setRepeatingRequest(
+                    mCaptureRequestBuilder.build(),
+                    new CameraCaptureSession.CaptureCallback() {
+                        @Override
+                        public void onCaptureStarted(CameraCaptureSession session,
+                                                     CaptureRequest request,
+                                                     long timestamp, long frameNumber) {
+                            super.onCaptureStarted(session, request, timestamp, frameNumber);
+                        }
+
+                        @Override
+                        public void onCaptureCompleted(CameraCaptureSession session,
+                                                   CaptureRequest request,
+                                                   TotalCaptureResult result) {
+                            super.onCaptureCompleted(session, request, result);
+                        }
+
+                        @Override
+                        public void onCaptureBufferLost(CameraCaptureSession session,
+                                                        CaptureRequest request, Surface target,
+                                                        long frameNumber) {
+                        }
+                    },
+                    mMainHandler);
+            } catch (CameraAccessException e) {
+                e.printStackTrace();
+            }
+        }
+
         /**
          * Opens a camera, and attempts to establish preview mode at the specified width
          * and height with a fixed frame rate.
@@ -727,68 +880,66 @@ public class TextureFromCameraActivity extends Activity implements SurfaceHolder
          * Sets mCameraPreviewWidth / mCameraPreviewHeight.
          */
         private void openCamera(int desiredWidth, int desiredHeight, int desiredFps) {
-            if (mCamera != null) {
+            if (mCameraDevice != null) {
                 throw new RuntimeException("camera already initialized");
             }
+            CameraManager manager = (CameraManager)mContext.getSystemService(Context.CAMERA_SERVICE);
+            Log.d(TAG, "Try to open camera with: " +
+                       desiredWidth + "x" + desiredHeight + "@" + desiredFps);
+            try {
+                mIsCameraStarted = true;
+                String mCameraId = getFirstFrontCameraId(manager);
+                manager.openCamera(
+                    mCameraId,
+                    new CameraDevice.StateCallback() {
+                        @Override
+                        public void onOpened(CameraDevice camera) {
+                            if (mIsCameraStarted) {
+                                Log.d(TAG, "Camera opened successfully");
+                                mCameraDevice = camera;
+                            } else {
+                                Log.w(TAG, "Discarding camera opened callback");
+                            }
+                        }
 
-            Camera.CameraInfo info = new Camera.CameraInfo();
+                        @Override
+                        public void onDisconnected(CameraDevice camera) {
+                            Log.d(TAG, "Camera disconnected");
+                            if (mCameraDevice != null) {
+                                mCameraDevice.close();
+                                mCameraDevice = null;
+                            }
+                        }
 
-            // Try to find a front-facing camera (e.g. for videoconferencing).
-            int numCameras = Camera.getNumberOfCameras();
-            for (int i = 0; i < numCameras; i++) {
-                Camera.getCameraInfo(i, info);
-                if (info.facing == Camera.CameraInfo.CAMERA_FACING_FRONT) {
-                    mCamera = Camera.open(i);
-                    break;
-                }
+                        @Override
+                        public void onError(CameraDevice camera, int error) {
+                            Log.d(TAG, "Camera error on opening");
+                            if (mCameraDevice != null) {
+                                mCameraDevice.close();
+                                mCameraDevice = null;
+                            }
+                        }
+                    },
+                    mHandler);
+            } catch (CameraAccessException e) {
+                e.printStackTrace();
+            } catch (SecurityException e) {
+                e.printStackTrace();
+            } catch (IllegalStateException e) {
+                e.printStackTrace();
             }
-            if (mCamera == null) {
-                Log.d(TAG, "No front-facing camera found; opening default");
-                mCamera = Camera.open();    // opens first back-facing camera
-            }
-            if (mCamera == null) {
-                throw new RuntimeException("Unable to open camera");
-            }
-
-            Camera.Parameters parms = mCamera.getParameters();
-
-            CameraUtils.choosePreviewSize(parms, desiredWidth, desiredHeight);
-
-            // Try to set the frame rate to a constant value.
-            int thousandFps = CameraUtils.chooseFixedPreviewFps(parms, desiredFps * 1000);
-
-            // Give the camera a hint that we're recording video.  This can have a big
-            // impact on frame rate.
-            parms.setRecordingHint(true);
-
-            mCamera.setParameters(parms);
-
-            int[] fpsRange = new int[2];
-            Camera.Size mCameraPreviewSize = parms.getPreviewSize();
-            parms.getPreviewFpsRange(fpsRange);
-            String previewFacts = mCameraPreviewSize.width + "x" + mCameraPreviewSize.height;
-            if (fpsRange[0] == fpsRange[1]) {
-                previewFacts += " @" + (fpsRange[0] / 1000.0) + "fps";
-            } else {
-                previewFacts += " @[" + (fpsRange[0] / 1000.0) +
-                        " - " + (fpsRange[1] / 1000.0) + "] fps";
-            }
-            Log.i(TAG, "Camera config: " + previewFacts);
-
-            mCameraPreviewWidth = mCameraPreviewSize.width;
-            mCameraPreviewHeight = mCameraPreviewSize.height;
+            mCameraPreviewWidth = desiredWidth;
+            mCameraPreviewHeight = desiredHeight;
             mMainHandler.sendCameraParams(mCameraPreviewWidth, mCameraPreviewHeight,
-                    thousandFps / 1000.0f);
+                    desiredFps / 1000.0f);
+
         }
 
         /**
          * Stops camera preview, and releases the camera to the system.
          */
         private void releaseCamera() {
-            if (mCamera != null) {
-                mCamera.stopPreview();
-                mCamera.release();
-                mCamera = null;
+            if (mCameraDevice != null) {
                 Log.d(TAG, "releaseCamera -- done");
             }
         }
@@ -845,10 +996,10 @@ public class TextureFromCameraActivity extends Activity implements SurfaceHolder
          * <p>
          * Call from UI thread.
          */
-        public void sendSurfaceChanged(@SuppressWarnings("unused") int format, int width,
-                int height) {
+        public void sendSurfaceChanged(@SuppressWarnings("unused") SurfaceHolder holder,
+            int format, int width, int height) {
             // ignore format
-            sendMessage(obtainMessage(MSG_SURFACE_CHANGED, width, height));
+            sendMessage(obtainMessage(MSG_SURFACE_CHANGED, width, height, holder));
         }
 
         /**
@@ -939,7 +1090,7 @@ public class TextureFromCameraActivity extends Activity implements SurfaceHolder
                     renderThread.surfaceAvailable((SurfaceHolder) msg.obj, msg.arg1 != 0);
                     break;
                 case MSG_SURFACE_CHANGED:
-                    renderThread.surfaceChanged(msg.arg1, msg.arg2);
+                    renderThread.surfaceChanged((SurfaceHolder) msg.obj, msg.arg1, msg.arg2);
                     break;
                 case MSG_SURFACE_DESTROYED:
                     renderThread.surfaceDestroyed();
